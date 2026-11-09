@@ -4,6 +4,45 @@
 
 DLSS Neural Rendering for DaVinci Resolve, with adjustable SDR/HDR detail, color and protection controls, up to three NR passes, optical-flow or external motion input, and optional anti-flicker. Version 0.4.1 is an experimental release.
 
+> **This is a fork of [SAOG0721/DaVinci-Resolve-DLSS5](https://github.com/SAOG0721/DaVinci-Resolve-DLSS5) with performance optimizations.** Image processing and controls are unchanged; the changes remove CPU overhead around the DLSS model. The Download and Install sections below describe the upstream release. This fork currently has no binary release, so build it from source ([building](docs/BUILDING.md)).
+
+## Fork: performance optimizations
+
+### Speedups
+
+Measured per-frame render time in the plugin's `Render timing` log, 1920x1080, 1 NR pass, RTX 4090:
+
+| Scenario | Upstream 0.4.1 | This fork | Speedup |
+| --- | --- | --- | --- |
+| Plugin optical flow on (Fusion page) | ~355 ms (~2.8 fps) | ~119 ms (~8.4 fps) | ~3x |
+| Flow Method None (Edit page) | ~93 ms (~10.7 fps) | ~67 ms (~15 fps) | ~1.4x |
+
+The DLSS model itself takes only ~5 ms of each frame. Most of the remaining time is the CPU bridge between Resolve and the model: copying, color encoding, upload/readback and compositing.
+
+Stage timings with plugin optical flow on:
+
+| Stage | Upstream 0.4.1 | This fork |
+| --- | --- | --- |
+| Optical flow (estimate and its CPU work) | ~220 ms | ~37 ms |
+| Fetching the previous (t-1) frame | ~22 ms | ~0 ms (reused) |
+| Frame fingerprint (SHA-256) | ~14 ms per frame hashed | ~2 ms |
+| Output finite-value check | ~14 ms | ~2 ms |
+| Motion vector float-to-half upload | inside ~27 ms prepare | inside ~13 ms prepare |
+
+### Optimizations
+
+- **Parallel frame fingerprinting.** Frames are hashed as parallel 128 KiB SHA-256 chunks, combined into one digest (`src/FrameDigest.h`). Every fingerprint site uses it, because digests are compared across the timeline, guidance cache and anti-flicker.
+- **Parallel validation.** The NR output and motion-field finite-value checks run row-parallel.
+- **Parallel optical flow CPU work.** The flow color proxy encode, AMDOF downsample and upscale, sparse-to-dense vector expansion, external motion conversion and the float-to-half motion upload all run on the shared row thread pool. They were single-threaded.
+- **Previous-frame reuse.** During sequential rendering, the frame packed on the previous call is reused as the t-1 flow reference instead of fetching and copying it from the host again. Its flow proxy encode is reused when the source fingerprint matches. Seeks, resets, failures and new exports clear the reuse.
+- **Detailed timing log.** The `Render timing` line in `%LOCALAPPDATA%\ResolveDlss5\ResolveDlss5.log` now breaks each frame into stages (parameters, copy, flow proxy and estimate, NR, fingerprint, validation, composite).
+- **Bounded log.** The log is cleared on the first write of each Resolve session instead of growing forever.
+- **CUDA 13 build support.** `cuCtxCreate` gained a parameters argument in CUDA 13; the build now supports CUDA 12 and 13.
+
+### Edit page vs Fusion page
+
+Use the Fusion page when temporal NR and motion matter. On the Edit page, Resolve renders two interleaved frame streams (t, t+5, t+1, t+6, …), so NR history resets on every frame and motion vectors give no temporal benefit. On the Fusion page, frames arrive in order and history is kept.
+
 ## Download
 
 Visit [GitHub Releases](https://github.com/SAOG0721/DaVinci-Resolve-DLSS5/releases).
