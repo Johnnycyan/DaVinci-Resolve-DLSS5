@@ -1191,23 +1191,28 @@ struct Feature18Runtime::Impl {
         inputSource.PlacedFootprint = inputFootprint;
         commandList->CopyTextureRegion(&inputDestination, 0, 0, 0, &inputSource, nullptr);
 
-        for (int y = 0; y < height; ++y) {
+        std::atomic<bool> motionValid{true};
+        parallelRows(height, static_cast<size_t>(width) * height, [&](int y) noexcept {
             auto* row = reinterpret_cast<uint16_t*>(
                 mappedMotion + static_cast<std::size_t>(y) * motionFootprint.Footprint.RowPitch);
             if (!motionTopLeft) {
                 // Keep explicit per-frame clearing after external/internal
                 // guidance, but do not convert millions of constant zeros.
                 std::memset(row, 0, static_cast<size_t>(width) * 2 * sizeof(uint16_t));
-                continue;
+                return;
             }
             for (int x = 0; x < width * 2; ++x) {
                 const float value = motionTopLeft[static_cast<std::size_t>(y) * width * 2 + x];
                 if (!std::isfinite(value) || std::abs(value) > 65504) {
-                    commandList->Close();
-                    return fail("Invalid dense motion vector");
+                    motionValid.store(false, std::memory_order_relaxed);
+                    return;
                 }
                 row[x] = DirectX::PackedVector::XMConvertFloatToHalf(value);
             }
+        });
+        if (!motionValid.load()) {
+            commandList->Close();
+            return fail("Invalid dense motion vector");
         }
         auto motionBarrier = transitionBarrier(motion.Get(), D3D12_RESOURCE_STATE_COMMON,
                                                D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1345,8 +1350,13 @@ void writeDiagnosticLog(const std::string& message) noexcept {
         std::filesystem::path directory = applicationDataDirectory().parent_path();
         std::error_code ignored;
         std::filesystem::create_directories(directory, ignored);
-        std::ofstream stream(directory / L"ResolveDlss5.log",
-                             std::ios::out | std::ios::app | std::ios::binary);
+        // Start a fresh log on the first write of each host process so the
+        // file cannot grow without bound across Resolve sessions.
+        static bool truncatedThisProcess = false;
+        const auto mode = std::ios::out | std::ios::binary |
+                          (truncatedThisProcess ? std::ios::app : std::ios::trunc);
+        truncatedThisProcess = true;
+        std::ofstream stream(directory / L"ResolveDlss5.log", mode);
         if (stream) {
             stream.write(line.data(), static_cast<std::streamsize>(line.size()));
         }

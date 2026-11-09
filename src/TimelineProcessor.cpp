@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT
 #include "TimelineProcessor.h"
 
-#include <Windows.h>
-#include <bcrypt.h>
-
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+
+#include "FrameDigest.h"
 
 namespace resolve_dlss5 {
 TimelineProcessor::TimelineProcessor(std::size_t budget) : budget_(budget) {}
@@ -40,26 +41,14 @@ TimelineProcessor::Signature TimelineProcessor::signature(double time, const Cpu
     value.settings.hdrTransferStrength = 1;
     for (int i = std::max(0, value.settings.passCount - 1); i < 2; ++i)
         value.settings.additionalPasses[i] = {};
-    const std::size_t bytes = frame.pixels.size() * sizeof(float);
-    if (bytes > std::numeric_limits<ULONG>::max())
-        throw std::invalid_argument("Current image is too large to fingerprint");
-    if (BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0,
-                   reinterpret_cast<PUCHAR>(const_cast<float*>(frame.pixels.data())),
-                   static_cast<ULONG>(bytes), value.digest.data(), 32) < 0)
-        throw std::runtime_error("Cannot fingerprint current source image");
+    fingerprintFloats(frame.pixels, value.digest.data());
     if (!frame.referencePixels.empty() && frame.referencePixels.size() != frame.pixels.size())
         throw std::invalid_argument("Invalid optical flow reference image");
     if (!frame.motion.empty() &&
         frame.motion.size() != static_cast<std::size_t>(frame.width) * frame.height * 2)
         throw std::invalid_argument("Invalid dense external motion extent");
     auto fingerprint = [&](const std::vector<float>& pixels, std::size_t offset) {
-        if (pixels.empty()) return;
-        const auto count = pixels.size() * sizeof(float);
-        if (count > std::numeric_limits<ULONG>::max() ||
-            BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0,
-                       reinterpret_cast<PUCHAR>(const_cast<float*>(pixels.data())),
-                       static_cast<ULONG>(count), value.digest.data() + offset, 32) < 0)
-            throw std::runtime_error("Cannot fingerprint optical flow inputs");
+        if (!pixels.empty()) fingerprintFloats(pixels, value.digest.data() + offset);
     };
     fingerprint(frame.referencePixels, 32);
     fingerprint(frame.motion, 64);
@@ -78,7 +67,14 @@ TimelineProcessor::Output TimelineProcessor::render(double time, const CpuFrame&
         if (abort && abort()) throw std::runtime_error("Streaming render cancelled");
         if (!std::isfinite(frameStep) || frameStep <= 0)
             throw std::invalid_argument("Invalid streaming frame step");
+        using Clock = std::chrono::steady_clock;
+        const auto ms = [](auto begin, auto end) {
+            return std::chrono::duration<double, std::milli>(end - begin).count();
+        };
+        stats_.signatureMs = stats_.evaluateMs = stats_.validateMs = 0;
+        const auto signatureStart = Clock::now();
         const Signature current = signature(time, frame);
+        stats_.signatureMs = ms(signatureStart, Clock::now());
         ++stats_.inputChecks;
         const bool sameDomain = committed_ && domain == domain_ && frameStep == frameStep_;
         if (sameDomain && cached_ && current == *committed_) {
@@ -96,12 +92,26 @@ TimelineProcessor::Output TimelineProcessor::render(double time, const CpuFrame&
         if (resetHistory) ++stats_.historyResets;
         // Evaluate owns the actual Reset flag. Do not destroy/recreate Feature
         // resources for every seek when an ordinary model-history reset suffices.
+        const auto evaluateStart = Clock::now();
         auto result = std::make_shared<std::vector<float>>(evaluate(frame, resetHistory));
+        const auto validateStart = Clock::now();
+        stats_.evaluateMs = ms(evaluateStart, validateStart);
         ++stats_.evaluatedFrames;
         if (result->size() != frame.pixels.size())
             throw std::runtime_error("Incomplete neural frame output");
-        for (float value : *result)
-            if (!std::isfinite(value)) throw std::runtime_error("Non-finite neural frame output");
+        std::atomic<bool> finite{true};
+        const std::size_t rowFloats = static_cast<std::size_t>(frame.width) * 4;
+        parallelRows(frame.height, static_cast<std::size_t>(frame.width) * frame.height,
+                     [&](int y) noexcept {
+                         const float* row = result->data() + static_cast<std::size_t>(y) * rowFloats;
+                         for (std::size_t i = 0; i < rowFloats; ++i)
+                             if (!std::isfinite(row[i])) {
+                                 finite.store(false, std::memory_order_relaxed);
+                                 return;
+                             }
+                     });
+        if (!finite.load()) throw std::runtime_error("Non-finite neural frame output");
+        stats_.validateMs = ms(validateStart, Clock::now());
         if (abort && abort()) throw std::runtime_error("Streaming render cancelled");
         committed_ = current;
         domain_ = domain;

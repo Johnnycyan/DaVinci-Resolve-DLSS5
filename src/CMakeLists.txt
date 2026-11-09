@@ -110,7 +110,7 @@ target_include_directories(ResolveOpticalFlow PRIVATE "${FFX_SHADERS}" "${NVOF_S
     "${FFX_ROOT}/backend/dx12" "${FFX_ROOT}/framegeneration/fsr3/include" "${CMAKE_CURRENT_SOURCE_DIR}/compat")
 target_compile_definitions(ResolveOpticalFlow PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 target_compile_options(ResolveOpticalFlow PRIVATE /utf-8 /EHsc)
-target_link_libraries(ResolveOpticalFlow PUBLIC CUDA::cuda_driver d3d12 dxgi)
+target_link_libraries(ResolveOpticalFlow PUBLIC CUDA::cuda_driver d3d12 dxgi bcrypt)
 set_target_properties(ResolveOpticalFlow PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 set(OFX_SUPPORT_SOURCES

@@ -24,6 +24,8 @@ enum class TimelineDomain { Interactive, Export };
 struct TimelineStats {
     std::uint64_t inputChecks = 0, evaluatedFrames = 0, cacheHits = 0, historyResets = 0;
     std::size_t cachedBytes = 0;
+    // Diagnostic wall-clock timings of the most recent render() call.
+    double signatureMs = 0, evaluateMs = 0, validateMs = 0;
 };
 // Streaming state accepts an already-fetched current frame. It has no API for
 // fetching an earlier frame and never reconstructs a full source trajectory.
