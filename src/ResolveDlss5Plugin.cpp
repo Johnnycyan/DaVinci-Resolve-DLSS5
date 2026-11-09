@@ -174,9 +174,14 @@ class ResolveDlss5Plugin final : public OFX::ImageEffect {
         bool processed = false;
         resolve_dlss5::RuntimeTimings nrTimings;
         double neuralMs = 0, compositeMs = 0, temporalMs = 0;
-        bool cacheHit = false, modelReset = false;
+        double paramsMs = milliseconds(fetched, Clock::now());
+        double packMs = 0, referenceMs = 0, timelineMs = 0, allocMs = 0, processMs = 0,
+               resultMs = 0, guidanceMs = 0;
+        resolve_dlss5::OpticalFlow::Timings flowTimings;
+        bool cacheHit = false, modelReset = false, referenceReused = false;
         if (settings.enabled && !(view == 0 && (mix == 0 || settings.detail.strength == 0))) {
             if (resetRequested_) {
+                previousSourceValid_ = false;
                 timeline_.invalidate();
                 runtime_->reset();
                 flow_.reset();
@@ -186,7 +191,10 @@ class ResolveDlss5Plugin final : public OFX::ImageEffect {
                 resetRequested_ = false;
             }
             renderStage_ = "pack-source";
+            const auto packStart = Clock::now();
             auto current = packedFrame(*source, arguments.time, bounds);
+            packMs = milliseconds(packStart, Clock::now());
+            const auto referenceStart = Clock::now();
             current.flow = flowAt(arguments.time);
             const auto demand = demandedFlowAt(arguments.time);
             std::vector<float> temporalReference;
@@ -208,23 +216,43 @@ class ResolveDlss5Plugin final : public OFX::ImageEffect {
                 renderStage_ = "reference-frame";
                 const auto refTime = referenceTime(arguments.time);
                 if (refTime != arguments.time) {
-                    std::unique_ptr<OFX::Image> reference(sourceClip_->fetchImage(refTime));
-                    validateImage(reference.get());
-                    auto referencePixels = packedFrame(*reference, refTime, bounds).pixels;
+                    std::vector<float> referencePixels;
+                    // Sequential renders already packed t-1 on the previous call.
+                    // Reuse that source instead of fetching and copying it again.
+                    if (previousSourceValid_ && previousSourceTime_ == refTime &&
+                        previousSourceBounds_.x1 == bounds.x1 &&
+                        previousSourceBounds_.y1 == bounds.y1 &&
+                        previousSourceBounds_.x2 == bounds.x2 &&
+                        previousSourceBounds_.y2 == bounds.y2 &&
+                        previousSourcePremultiplied_ == current.settings.premultiplied &&
+                        previousSource_.size() == current.pixels.size()) {
+                        referencePixels = std::move(previousSource_);
+                        referenceReused = true;
+                    } else {
+                        std::unique_ptr<OFX::Image> reference(sourceClip_->fetchImage(refTime));
+                        validateImage(reference.get());
+                        referencePixels = packedFrame(*reference, refTime, bounds).pixels;
+                    }
+                    previousSourceValid_ = false;
                     if (current.flow.method != resolve_dlss5::FlowMethod::None)
                         current.referencePixels = std::move(referencePixels);
                     else
                         temporalReference = std::move(referencePixels);
                 }
             }
+            referenceMs = milliseconds(referenceStart, Clock::now());
             const auto cacheHits = timeline_.stats().cacheHits;
             renderStage_ = "nr";
+            const auto timelineStart = Clock::now();
             const auto neural = timeline_.render(
                 arguments.time, current,
                 [&](const resolve_dlss5::CpuFrame& frame, bool reset) {
                     modelReset = reset;
+                    const auto allocStart = Clock::now();
                     std::vector<float> result(frame.pixels.size());
+                    allocMs = milliseconds(allocStart, Clock::now());
                     sharedMotion_.reset();
+                    const auto guidanceStart = Clock::now();
                     if (frame.flow.external ||
                         (!frame.referencePixels.empty() &&
                          frame.flow.method != resolve_dlss5::FlowMethod::None))
@@ -233,15 +261,22 @@ class ResolveDlss5Plugin final : public OFX::ImageEffect {
                             frame.referencePixels, frame.motion, [&] {
                                 return frame.flow.external
                                            ? frame.motion
-                                           : flow_.estimate(frame.pixels, frame.referencePixels,
-                                                            width, height, frame.settings,
-                                                            frame.flow);
+                                           : [&] {
+                                                 auto field = flow_.estimate(
+                                                     frame.pixels, frame.referencePixels, width,
+                                                     height, frame.settings, frame.flow);
+                                                 flowTimings = flow_.lastTimings();
+                                                 return field;
+                                             }();
                             });
+                    const auto processStart = Clock::now();
+                    guidanceMs = milliseconds(guidanceStart, processStart);
                     if (!runtime_->process(
                             frame.pixels.data(), frame.width * 16, result.data(), frame.width * 16,
                             frame.width, frame.height, frame.settings, reset, true,
                             sharedMotion_ ? sharedMotion_->data() : nullptr, &nrTimings))
                         throw std::runtime_error(runtime_->lastError());
+                    processMs = milliseconds(processStart, Clock::now());
                     return result;
                 },
                 [&] { runtime_->reset(); }, [&] { return abort(); },
@@ -251,6 +286,9 @@ class ResolveDlss5Plugin final : public OFX::ImageEffect {
                     ? 1.0
                     : (preview ? 1.0 : sequenceFrameStep_));
             const auto compositeStart = Clock::now();
+            timelineMs = milliseconds(timelineStart, compositeStart);
+            resultMs = timelineMs - timeline_.stats().signatureMs - timeline_.stats().evaluateMs -
+                       timeline_.stats().validateMs;
             renderStage_ = "composite";
             cacheHit = timeline_.stats().cacheHits != cacheHits;
             neuralMs = milliseconds(fetched, compositeStart);
@@ -322,7 +360,14 @@ class ResolveDlss5Plugin final : public OFX::ImageEffect {
                 source->getRowBytes(), pixels.data(), width * 16, width, height, arguments.time);
             compositeMs = milliseconds(compositeStart, Clock::now());
             processed = true;
+            // Keep this frame's packed source as the next sequential reference.
+            previousSource_ = std::move(current.pixels);
+            previousSourceTime_ = arguments.time;
+            previousSourceBounds_ = bounds;
+            previousSourcePremultiplied_ = current.settings.premultiplied;
+            previousSourceValid_ = true;
         } else {
+            previousSourceValid_ = false;
             antiFlicker_.setGpuDevice(nullptr);
             antiFlicker_.invalidate();
         }
@@ -357,7 +402,23 @@ class ResolveDlss5Plugin final : public OFX::ImageEffect {
                 ", nr-init=" + std::to_string(nrTimings.initializeMs) +
                 ", nr-prepare=" + std::to_string(nrTimings.prepareMs) +
                 ", nr-submit-wait=" + std::to_string(nrTimings.submitWaitMs) + ", nr-readback=" +
-                std::to_string(nrTimings.readbackMs) + ", fps=" + std::to_string(lastTemporalFps_) +
+                std::to_string(nrTimings.readbackMs) +
+                ", nr-total=" + std::to_string(nrTimings.totalMs) +
+                " | detail: params=" + std::to_string(paramsMs) +
+                ", pack=" + std::to_string(packMs) + ", flow-ref=" + std::to_string(referenceMs) +
+                ", ref-reused=" + (referenceReused ? "1" : "0") +
+                ", proxy-reused=" + (flowTimings.proxyReused ? "1" : "0") +
+                ", timeline=" + std::to_string(timelineMs) +
+                ", tl-signature=" + std::to_string(timeline_.stats().signatureMs) +
+                ", tl-evaluate=" + std::to_string(timeline_.stats().evaluateMs) +
+                ", eval-alloc=" + std::to_string(allocMs) +
+                ", eval-guidance=" + std::to_string(guidanceMs) +
+                ", flow-proxy=" + std::to_string(flowTimings.proxyMs) +
+                ", flow-estimate=" + std::to_string(flowTimings.estimateMs) +
+                ", eval-process=" + std::to_string(processMs) +
+                ", tl-validate=" + std::to_string(timeline_.stats().validateMs) +
+                ", tl-other=" + std::to_string(resultMs) + " | fps=" +
+                std::to_string(lastTemporalFps_) +
                 ", fps-source=" + frameRateSource_ + ", preview=" + std::to_string(preview));
         }
     }
@@ -454,6 +515,7 @@ class ResolveDlss5Plugin final : public OFX::ImageEffect {
         // Reset only a new explicit multi-frame export; timeline/domain keys
         // handle seeks, reversals, geometry and parameter changes themselves.
         if (!sequenceInteractive_ && args.frameRange.max > args.frameRange.min) {
+            previousSourceValid_ = false;
             timeline_.invalidate();
             flow_.reset();
             guidance_.invalidate();
@@ -472,6 +534,7 @@ class ResolveDlss5Plugin final : public OFX::ImageEffect {
 
    private:
     void resetAfterFailure() noexcept {
+        previousSourceValid_ = false;
         try {
             timeline_.invalidate();
             antiFlicker_.setGpuDevice(nullptr);
@@ -901,6 +964,11 @@ class ResolveDlss5Plugin final : public OFX::ImageEffect {
     resolve_dlss5::FrameGuidanceCache guidance_;
     resolve_dlss5::FrameGuidanceCache::Output sharedMotion_;
     resolve_dlss5::AntiFlicker antiFlicker_;
+    // Packed source of the last processed frame, reused as the t-1 reference.
+    std::vector<float> previousSource_;
+    double previousSourceTime_ = 0;
+    OfxRectI previousSourceBounds_{};
+    bool previousSourcePremultiplied_ = false, previousSourceValid_ = false;
     double sequenceFrameStep_ = 1;
     bool runtimeErrorVisible_ = false;
     bool sequenceInteractive_ = false;

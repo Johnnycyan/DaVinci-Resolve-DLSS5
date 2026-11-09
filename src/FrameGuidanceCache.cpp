@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 #include "FrameGuidanceCache.h"
 
-#include <Windows.h>
-#include <bcrypt.h>
-
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+
+#include "FrameDigest.h"
 namespace resolve_dlss5 {
 FlowSettings activeFlowSettings(FlowSettings s) {
     if (s.external) {
@@ -52,13 +52,7 @@ FrameGuidanceCache::Output FrameGuidanceCache::get(
     key.codec.referenceWhiteNits = color.referenceWhiteNits;
     key.codec.peakNits = color.peakNits;
     auto hash = [&](std::span<const float> values, int offset) {
-        if (values.empty()) return;
-        const auto bytes = values.size_bytes();
-        if (bytes > std::numeric_limits<ULONG>::max() ||
-            BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0,
-                       reinterpret_cast<PUCHAR>(const_cast<float*>(values.data())),
-                       static_cast<ULONG>(bytes), key.digest.data() + offset, 32) < 0)
-            throw std::runtime_error("Cannot fingerprint guidance input");
+        if (!values.empty()) fingerprintFloats(values, key.digest.data() + offset);
     };
     hash(current, 0);
     hash(reference, 32);
@@ -70,8 +64,17 @@ FrameGuidanceCache::Output FrameGuidanceCache::get(
     try {
         auto output = std::make_shared<const MotionField>(produce());
         if (output->size() != count * 2) throw std::runtime_error("Incomplete shared motion field");
-        for (float v : *output)
-            if (!std::isfinite(v)) throw std::runtime_error("Non-finite shared motion field");
+        std::atomic<bool> finite{true};
+        const std::size_t rowFloats = static_cast<std::size_t>(width) * 2;
+        parallelRows(height, count, [&](int y) noexcept {
+            const float* row = output->data() + static_cast<std::size_t>(y) * rowFloats;
+            for (std::size_t i = 0; i < rowFloats; ++i)
+                if (!std::isfinite(row[i])) {
+                    finite.store(false, std::memory_order_relaxed);
+                    return;
+                }
+        });
+        if (!finite.load()) throw std::runtime_error("Non-finite shared motion field");
         output_ = std::move(output);
         key_ = key;
         ++revision_;

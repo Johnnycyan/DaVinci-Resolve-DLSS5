@@ -6,6 +6,8 @@
 #include <nvOpticalFlowCuda.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -13,6 +15,8 @@
 
 #include "AmdFlow.h"
 #include "ColorPipeline.h"
+#include "FrameDigest.h"
+#include "ParallelRows.h"
 
 namespace resolve_dlss5 {
 namespace {
@@ -46,7 +50,8 @@ MotionField adaptExternalMotion(std::span<const float> rgba, int w, int h, const
         s.xChannel == s.yChannel || !std::isfinite(s.scaleX) || !std::isfinite(s.scaleY))
         throw std::invalid_argument("Invalid external motion channel/scale");
     MotionField result(static_cast<std::size_t>(w) * h * 2);
-    for (int y = 0; y < h; ++y)
+    std::atomic<bool> valid{true};
+    parallelRows(h, static_cast<std::size_t>(w) * h, [&](int y) noexcept {
         for (int x = 0; x < w; ++x) {
             const auto input = (static_cast<std::size_t>(h - 1 - y) * w + x) * 4;
             const auto output = (static_cast<std::size_t>(y) * w + x) * 2;
@@ -55,19 +60,24 @@ MotionField adaptExternalMotion(std::span<const float> rgba, int w, int h, const
             const float vy = rgba[input + s.yChannel] * s.scaleY *
                              (s.units == FlowUnits::Normalized ? h : 1) * (s.yUp ? -1.f : 1.f);
             if (!std::isfinite(vx) || !std::isfinite(vy) || std::abs(vx) > 65504 ||
-                std::abs(vy) > 65504)
-                throw std::invalid_argument(
-                    "External motion contains non-finite or FP16-incompatible values");
+                std::abs(vy) > 65504) {
+                valid.store(false, std::memory_order_relaxed);
+                return;
+            }
             result[output] = vx;
             result[output + 1] = vy;
         }
+    });
+    if (!valid.load())
+        throw std::invalid_argument(
+            "External motion contains non-finite or FP16-incompatible values");
     return result;
 }
 std::vector<unsigned char> makeFlowProxy(std::span<const float> rgba, int w, int h,
                                          const Feature18Settings& s) {
     extent(rgba.size(), w, h);
     std::vector<unsigned char> result(rgba.size());
-    for (int y = 0; y < h; ++y)
+    parallelRows(h, static_cast<std::size_t>(w) * h, [&](int y) noexcept {
         for (int x = 0; x < w; ++x) {
             const auto i = (static_cast<std::size_t>(h - 1 - y) * w + x) * 4;
             Rgb rgb{rgba[i], rgba[i + 1], rgba[i + 2]};
@@ -79,6 +89,7 @@ std::vector<unsigned char> makeFlowProxy(std::span<const float> rgba, int w, int
             std::copy(pixel.begin(), pixel.end(),
                       result.begin() + (static_cast<std::size_t>(y) * w + x) * 4);
         }
+    });
     return result;
 }
 struct OpticalFlow::Impl {
@@ -111,8 +122,14 @@ struct OpticalFlow::Impl {
         checkCu(cuInit(0), "Initialize optical flow CUDA driver");
         CUdevice device = 0;
         checkCu(cuDeviceGet(&device, 0), "Select optical flow CUDA device");
+#if CUDA_VERSION >= 13000
+        // CUDA 13 added a CUctxCreateParams argument; nullptr keeps defaults.
+        checkCu(cuCtxCreate(&context, nullptr, CU_CTX_SCHED_BLOCKING_SYNC, device),
+                "Create optical flow context");
+#else
         checkCu(cuCtxCreate(&context, CU_CTX_SCHED_BLOCKING_SYNC, device),
                 "Create optical flow context");
+#endif
         CUcontext popped = nullptr;
         checkCu(cuCtxPopCurrent(&popped), "Restore caller CUDA context");
         ContextScope scope(context);
@@ -216,6 +233,7 @@ struct OpticalFlow::Impl {
 OpticalFlow::OpticalFlow() : impl_(std::make_unique<Impl>()) {}
 OpticalFlow::~OpticalFlow() = default;
 void OpticalFlow::reset() {
+    lastProxy_ = {};
     impl_->destroy();
     impl_->amd.reset();
 }
@@ -228,10 +246,43 @@ MotionField OpticalFlow::estimate(std::span<const float> current, std::span<cons
     if ((s.method == FlowMethod::Nvidia && (s.nvidiaQuality < 1 || s.nvidiaQuality > 5)) ||
         (s.method == FlowMethod::Amd && (s.amdQuality < 0 || s.amdQuality > 1)))
         throw std::invalid_argument("Invalid optical flow quality");
-    const auto a = makeFlowProxy(current, w, h, codec);
-    const auto b = makeFlowProxy(previous, w, h, codec);
-    if (s.method == FlowMethod::Nvidia) return impl_->nvidia(a, b, w, h, s.nvidiaQuality);
-    if (s.method == FlowMethod::Amd) return impl_->amd.estimate(a, b, w, h, s.amdQuality);
-    throw std::invalid_argument("Unknown optical flow method");
+    using Clock = std::chrono::steady_clock;
+    const auto ms = [](auto begin, auto end) {
+        return std::chrono::duration<double, std::milli>(end - begin).count();
+    };
+    timings_ = {};
+    const auto proxyStart = Clock::now();
+    // The proxy encode is deterministic, so the previous call's current-frame
+    // proxy is valid for this reference exactly when the source bytes match.
+    std::array<unsigned char, 32> currentDigest{}, previousDigest{};
+    fingerprintFloats(previous, previousDigest.data());
+    std::vector<unsigned char> b;
+    if (lastProxy_.valid && lastProxy_.width == w && lastProxy_.height == h &&
+        lastProxy_.codec == codec && lastProxy_.digest == previousDigest) {
+        b = std::move(lastProxy_.proxy);
+        timings_.proxyReused = true;
+    } else {
+        b = makeFlowProxy(previous, w, h, codec);
+    }
+    lastProxy_.valid = false;
+    auto a = makeFlowProxy(current, w, h, codec);
+    fingerprintFloats(current, currentDigest.data());
+    const auto estimateStart = Clock::now();
+    timings_.proxyMs = ms(proxyStart, estimateStart);
+    MotionField result;
+    if (s.method == FlowMethod::Nvidia)
+        result = impl_->nvidia(a, b, w, h, s.nvidiaQuality);
+    else if (s.method == FlowMethod::Amd)
+        result = impl_->amd.estimate(a, b, w, h, s.amdQuality);
+    else
+        throw std::invalid_argument("Unknown optical flow method");
+    timings_.estimateMs = ms(estimateStart, Clock::now());
+    lastProxy_.proxy = std::move(a);
+    lastProxy_.digest = currentDigest;
+    lastProxy_.codec = codec;
+    lastProxy_.width = w;
+    lastProxy_.height = h;
+    lastProxy_.valid = true;
+    return result;
 }
 }  // namespace resolve_dlss5

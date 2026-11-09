@@ -14,6 +14,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "ParallelRows.h"
+
 namespace resolve_dlss5 {
 using Microsoft::WRL::ComPtr;
 std::vector<float> densifyFlow(std::span<const int16_t> sparse, int sw, int sh, int w, int h,
@@ -22,13 +24,13 @@ std::vector<float> densifyFlow(std::span<const int16_t> sparse, int sw, int sh, 
         sparse.size() != static_cast<std::size_t>(sw) * sh * 2)
         throw std::invalid_argument("Invalid sparse motion field");
     std::vector<float> result(static_cast<std::size_t>(w) * h * 2);
-    auto sample = [&](int x, int y, int c) {
+    auto sample = [&](int x, int y, int c) noexcept {
         return static_cast<float>(sparse[(static_cast<std::size_t>(std::clamp(y, 0, sh - 1)) * sw +
                                           std::clamp(x, 0, sw - 1)) *
                                              2 +
                                          c]);
     };
-    for (int y = 0; y < h; ++y)
+    parallelRows(h, static_cast<std::size_t>(w) * h, [&](int y) noexcept {
         for (int x = 0; x < w; ++x) {
             const float px = (x + .5f) / grid - .5f, py = (y + .5f) / grid - .5f;
             const int ix = static_cast<int>(std::floor(px)), iy = static_cast<int>(std::floor(py));
@@ -39,6 +41,7 @@ std::vector<float> densifyFlow(std::span<const int16_t> sparse, int sw, int sh, 
                               std::lerp(sample(ix, iy + 1, c), sample(ix + 1, iy + 1, c), fx), fy) *
                     (c == 0 ? sx : sy);
         }
+    });
     return result;
 }
 namespace {
@@ -192,7 +195,7 @@ struct AmdFlow::Impl {
         void* mapped = nullptr;
         D3D12_RANGE noRead{0, 0};
         hr(upload->Map(0, &noRead, &mapped), "Map AMD OF color upload");
-        for (int y = 0; y < ih; ++y)
+        parallelRows(ih, static_cast<std::size_t>(iw) * ih, [&](int y) noexcept {
             for (int x = 0; x < iw; ++x) {
                 unsigned sum[4]{};
                 unsigned count = 0;
@@ -209,6 +212,7 @@ struct AmdFlow::Impl {
                         mapped)[static_cast<std::size_t>(y) * colorFootprint.Footprint.RowPitch +
                                 x * 4 + c] = static_cast<unsigned char>(sum[c] / count);
             }
+        });
         upload->Unmap(0, nullptr);
         hr(allocator->Reset(), "Reset AMD OF allocator");
         hr(list->Reset(allocator.Get(), nullptr), "Reset AMD OF list");
@@ -275,11 +279,11 @@ struct AmdFlow::Impl {
                                  static_cast<float>(height) / ih);
         if (iw == width && ih == height) return dense;
         std::vector<float> result(static_cast<std::size_t>(width) * height * 2);
-        for (int y = 0; y < height; ++y)
+        parallelRows(height, static_cast<std::size_t>(width) * height, [&](int y) noexcept {
             for (int x = 0; x < width; ++x) {
                 float px = (x + .5f) * iw / width - .5f, py = (y + .5f) * ih / height - .5f;
                 int ix = static_cast<int>(std::floor(px)), iy = static_cast<int>(std::floor(py));
-                auto sample = [&](int xx, int yy, int c) {
+                auto sample = [&](int xx, int yy, int c) noexcept {
                     return dense[(static_cast<std::size_t>(std::clamp(yy, 0, ih - 1)) * iw +
                                   std::clamp(xx, 0, iw - 1)) *
                                      2 +
@@ -291,6 +295,7 @@ struct AmdFlow::Impl {
                         std::lerp(sample(ix, iy + 1, c), sample(ix + 1, iy + 1, c), px - ix),
                         py - iy);
             }
+        });
         return result;
     }
 };

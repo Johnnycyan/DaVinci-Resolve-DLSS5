@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #pragma once
+#include <array>
 #include <memory>
 #include <span>
 #include <vector>
@@ -35,9 +36,24 @@ class OpticalFlow final {
     MotionField estimate(std::span<const float> current, std::span<const float> previous, int width,
                          int height, const Feature18Settings& codec, const FlowSettings& settings);
     void reset();
+    // Diagnostic wall-clock timings of the most recent estimate() call.
+    struct Timings {
+        double proxyMs = 0, estimateMs = 0;
+        bool proxyReused = false;
+    };
+    const Timings& lastTimings() const noexcept { return timings_; }
 
    private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    Timings timings_;
+    // The current frame's proxy becomes the next sequential frame's reference.
+    struct ProxyCache {
+        std::vector<unsigned char> proxy;
+        std::array<unsigned char, 32> digest{};
+        Feature18Settings codec;
+        int width = 0, height = 0;
+        bool valid = false;
+    } lastProxy_;
 };
 }  // namespace resolve_dlss5
