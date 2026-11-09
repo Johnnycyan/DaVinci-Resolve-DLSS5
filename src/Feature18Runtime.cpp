@@ -1350,8 +1350,13 @@ void writeDiagnosticLog(const std::string& message) noexcept {
         std::filesystem::path directory = applicationDataDirectory().parent_path();
         std::error_code ignored;
         std::filesystem::create_directories(directory, ignored);
-        std::ofstream stream(directory / L"ResolveDlss5.log",
-                             std::ios::out | std::ios::app | std::ios::binary);
+        // Start a fresh log on the first write of each host process so the
+        // file cannot grow without bound across Resolve sessions.
+        static bool truncatedThisProcess = false;
+        const auto mode = std::ios::out | std::ios::binary |
+                          (truncatedThisProcess ? std::ios::app : std::ios::trunc);
+        truncatedThisProcess = true;
+        std::ofstream stream(directory / L"ResolveDlss5.log", mode);
         if (stream) {
             stream.write(line.data(), static_cast<std::streamsize>(line.size()));
         }
